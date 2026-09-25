@@ -16,6 +16,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.4,<9", "ruff>=0.12,<1"]
+# Qwen3-8B reasoning agent (GPU). torch is expected to be preinstalled (e.g. Kaggle images).
+llm = ["transformers>=4.51", "accelerate>=1.0", "bitsandbytes>=0.45", "huggingface_hub>=0.30"]
 
 [project.scripts]
 day09 = "student_agent.cli:main"
