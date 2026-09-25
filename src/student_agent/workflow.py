@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 from openai import AsyncOpenAI
@@ -671,8 +672,8 @@ class MultiAgentWorkflow:
 
         # Optional LLM setup
         self.llm_api_key = os.getenv("LLM_API_KEY")
-        self.llm_base_url = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
-        self.llm_model = os.getenv("LLM_MODEL", "gemma2-9b-it")
+        self.llm_base_url = os.getenv("LLM_BASE_URL", "https://router.huggingface.co/v1")
+        self.llm_model = os.getenv("LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct:novita")
         self.llm_client = (
             AsyncOpenAI(api_key=self.llm_api_key, base_url=self.llm_base_url)
             if self.llm_api_key
