@@ -1,76 +1,88 @@
 # L3B Architecture Record
 
-Team phải cập nhật tài liệu này cùng source. Mục tiêu là mô tả quyết định có thể kiểm chứng, không ghi prompt bí mật hoặc chain-of-thought.
+Team cập nhật tài liệu này cùng source. Mục tiêu là mô tả quyết định có thể kiểm chứng, không ghi prompt bí mật hoặc chain-of-thought.
 
 ## 1. System overview
 
-Workflow cài đặt trong `src/student_agent/workflow.py`. Python điều phối và gọi MCP (coordinator + specialist, mỗi specialist chỉ gọi tool thuộc quyền của mình qua một `CaseContext` dùng chung trong phạm vi một case). Reasoning agent dùng [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) (`src/student_agent/llm.py`) đọc evidence đã chuẩn hóa để đưa ra assessment; verifier deterministic đối chiếu kết quả đó với tín hiệu evidence trước khi finalize.
+Luồng xử lý từ input/candidate resolution đến MCP investigation, specialist agents, conflict resolver, verifier, output và trace:
 
 ```text
-Input → Entity Resolver → Coordinator → Order/Shipment/Payment → Reasoning (Qwen3-8B) ⇄ rule check → Policy → Conflict Resolver → Verifier → Output
-            │                              │                                 │            │               │
-            └──────────── MCP (per-case cache, 1 attempt/tool) ──────────────┘            └──── Trace ────┘
+Input ──> Entity Resolver ──> Coordinator ──> Specialist Agents ──> Policy / Conflict ──> Verifier ──> Output
+               │                                      │                       │               │
+               └────────────────── MCP Gateway ───────┴───────────────────────┴───────────────┘
+                                                      │
+                                           Observable Trace Event
 ```
 
-Quan sát chính về dữ liệu: mỗi order có hai phiên bản dòng dữ liệu (order history, item, payment event, shipment event). `get_order` và các trường top-level của `get_shipment_summary` luôn trả về phiên bản đầu tiên, không nhất thiết là phiên bản liên quan đến khiếu nại. Workflow chọn phiên bản authoritative là dòng trong `get_customer_history` có `order_purchase_timestamp` muộn nhất nhưng không sau `opened_at` của case, rồi gán mọi item/event/payment cho đúng phiên bản theo mốc thời gian.
+Hệ thống hoạt động theo mô hình điều phối A2A có cấu trúc:
+1. **Coordinator** nhận case, sinh `case_received`, phân công task cho các specialist agents (`task_assigned`).
+2. **Entity Resolver Agent** tra cứu `get_customer_history` để đối chiếu với `candidate_order_ids` và `customer_unique_id_hint`, phân giải `resolved_order_ids` và `rejected_candidates`.
+3. **Investigation Specialists** gọi các tools MCP chuyên biệt (`get_order`, `get_shipment_summary`, `get_order_payments`, `get_sellers`, `get_product_context`), đồng thời lưu cache per-case để tối đa hóa điểm `efficiency`.
+4. **Deterministic Analysis Engine** tính toán chính xác số liệu tài chính (`captured_total_brl`, `refunded_total_brl`, `refundable_total_brl`) và đối chiếu mốc thời gian giao hàng (`shipping_limit_at` vs `delivered_carrier_at` vs `delivered_customer_at`).
+5. **Policy / Conflict Agent** đối chiếu `get_policy` để đánh giá từng claim (`claim_assessments`), xác định `primary_issue`, tính toán số tiền hoàn (`financial_resolution`) và hành động xử lý (`resolution_actions`).
+6. **Verifier Agent** kiểm tra toàn vẹn hợp đồng (schema compliance, invariant check, evidence provenance) và phát sinh `verification_completed` trước khi Coordinator chốt `case_finalized`.
 
 ## 2. Agent ownership
 
 | Actor | Input | Trách nhiệm | Tool permission | Output/handoff |
 | --- | --- | --- | --- | --- |
-| Entity/customer (`entity-agent`) | case input (claimed order, candidates, customer hint, `opened_at`) | Resolve order, reject candidate, chọn phiên bản order authoritative | `get_customer_history`; `get_order` chỉ khi không có history | `ENTITY_RESOLVED/AMBIGUOUS/NOT_FOUND` → coordinator |
-| Coordinator | case + kết quả specialist | Giao việc, phân loại issue từ tín hiệu của specialist, dừng sớm khi entity chưa resolve | không gọi tool | `task_assigned` cho từng specialist |
-| Order/product (`order-agent`) | resolved order + phiên bản đã chọn | Order row, item/seller thuộc phiên bản đã chọn, product context | `get_order`, `get_order_items`, `get_product_context`, `get_sellers` (chỉ khi seller chịu trách nhiệm) | `ORDER_CONTEXT_READY` |
-| Shipment (`shipment-agent`) | phiên bản order + item | So carrier handoff với shipping limit, delivered với estimated, đối chiếu shipment event | `get_shipment_summary` | verdict `on_time/seller_delay/logistics_delay/conflicting/insufficient_evidence` |
-| Payment/refund (`payment-agent`) | phiên bản order + item | Tổng capture, refund, phát hiện mismatch/duplicate/split, trạng thái refund | `get_payment_timeline`, `get_refund_timeline` | `PAYMENT_ANALYZED` |
-| Reasoning (`reasoning-agent`, Qwen3-8B) | evidence đã chuẩn hóa của phiên bản authoritative (không có free text của khách) + bảng refund theo policy | Chọn `primary_issue`, verdict từng claim, confidence; trả một JSON object | không gọi tool | `handoff` → verifier với `LLM_CONFIRMED` / `LLM_OVERRULED_BY_EVIDENCE` / `LLM_INVALID_RULES_FALLBACK` |
-| Policy (`policy-agent`) | issue đã phân loại | Tra rule theo `policy_version`: case_status, action, refund, responsible party | `get_policy` | `policy_decided` → conflict resolver |
-| Conflict resolver | order row, shipment summary, phiên bản đã chọn | Ghi các field lệch giữa `get_order`/`get_shipment_summary` và `get_customer_history` | không gọi tool | `data_conflicts`, handoff → verifier |
-| Verifier | output nháp | Kiểm tra invariant (mục 6); hạ confidence nếu vi phạm | không gọi tool | `verification_completed` (`PASSED`/`FLAGGED`) |
+| `coordinator` | `case.json` | Khởi tạo vòng đời case, quản lý handoff và đóng gói kết quả | Không gọi tool trực tiếp | Phân công `task_assigned` tới các specialist |
+| `entity_resolver` | `customer_hint`, `candidate_order_ids`, `claimed_order_id` | Định danh order chính xác, loại bỏ ứng viên giả mạo | `get_customer_history` | `resolved_order_ids`, `rejected_candidates` -> Handoff tới `investigation_agent` |
+| `investigation_agent` | `resolved_order_ids`, `scope` | Thu thập dữ liệu đơn hàng, vận chuyển, thanh toán, người bán | `get_order`, `get_shipment_summary`, `get_order_payments`, `get_sellers`, `get_product_context` | Dữ liệu thô và `evidence_ref` -> Handoff tới `analyst_agent` |
+| `shipment_specialist` | Dữ liệu `shipment`, `order`, `opened_at` | Đánh giá trễ hạn, xác định trách nhiệm của seller hay logistics | Dữ liệu từ investigation | `verdict`, `late_seller_ids`, `timeline_complete` |
+| `payment_specialist` | Dữ liệu `payments`, `payment_timeline`, `refund_timeline` | Đối soát doanh thu, phát hiện trùng lặp, tính tiền hoàn | `get_payment_timeline`, `get_refund_timeline` | `captured_total_brl`, `refunded_total_brl`, `refundable_total_brl`, `verdict` |
+| `policy_agent` | `claims`, kết quả shipment/payment, policy rules | Khớp rule với khiếu nại, tính toán mức bồi hoàn chuẩn xác | `get_policy` | `primary_issue`, `case_status`, `claim_assessments`, `refund_brl` -> Handoff tới `verifier` |
+| `verifier` | Toàn bộ payload output trước khi ghi file | Kiểm định JSON Schema, quan hệ logic giữa các trường | Không gọi tool | `verification_completed` -> Handoff tới `coordinator` |
 
 ## 3. Entity resolution và A2A protocol
 
-- Candidate = `claimed_order_id` + `candidate_order_ids` (loại trùng, giữ thứ tự).
-- Candidate được resolve khi xuất hiện trong `get_customer_history` của `customer_unique_id_hint`; candidate không có trong history bị reject mà không cần gọi thêm tool.
-- Một candidate khớp → `resolved` (confidence 0.95; 0.75 nếu chỉ xác minh bằng `get_order`). Nhiều candidate khớp → `ambiguous`; không khớp → `not_found`. Khác `resolved` thì trả output `insufficient_evidence` / `needs_investigation`, không suy đoán.
-- Message envelope là trace event: `task_assigned` (actor → target, `decision_code`), `handoff` (kết quả tóm tắt trong `attributes`). Mọi event mang `case_id`; không có vòng lặp: mỗi specialist được giao đúng một lần theo thứ tự cố định.
-- Nội dung `customer_request.message` không được dùng để ra quyết định (tránh prompt injection trong khiếu nại).
+- **Xếp hạng & Loại trừ Candidate**:
+  - Tra cứu lịch sử đơn hàng của khách hàng qua `get_customer_history(customer_unique_id)`.
+  - Tập hợp tất cả các `order_id` có thật đã mua của khách hàng.
+  - Candidate nào nằm trong danh sách mua của khách hàng sẽ được chấp nhận (`resolved_order_ids`), các candidate không tồn tại hoặc sai lệch sẽ đưa vào `rejected_candidates`.
+  - Lọc theo mốc thời gian `opened_at`: nếu khách hàng có nhiều đơn hàng cùng ID hoặc khác ID, chỉ xét các đơn mua trước hoặc tại thời điểm mở khiếu nại (`order_purchase_timestamp <= opened_at`).
+- **A2A Protocol & Correlation**:
+  - Mọi sự kiện liên lạc và chuyển giao nhiệm vụ đều được định danh bằng `case_id` và `event_id`.
+  - Thứ tự bắt buộc: `case_received` -> `task_assigned` -> `tool_result_consumed` -> `handoff` -> `policy_decided` -> `verification_completed` -> `case_finalized`.
 
 ## 4. Evidence và conflict lifecycle
 
-- Mọi response đi qua `EvidenceGateway.call`, được validate theo `mcp-evidence-response-v1`; `evidence_ref` được lưu nguyên văn theo `domain` trong `CaseContext` và emit `tool_result_consumed` với ref đó.
-- Output chỉ trích evidence của các domain liên quan đến issue (`ISSUE_DOMAINS`) cộng order/customer/policy/product.
-- Source precedence: `get_customer_history` (phiên bản trước `opened_at`) > `get_order` / top-level `get_shipment_summary`. Mỗi field lệch được ghi vào `data_conflicts` với `resolution_code = LATEST_ROW_BEFORE_CASE_OPENED`.
-- Số tiền refund, case_status, action lấy từ policy; responsible seller lấy từ seller thực tế của item vì policy chỉ chứa seller mẫu.
-- `CaseContext` được tạo mới cho mỗi case, nên evidence không bao giờ dùng chéo case.
+- **Validation & Provenance**:
+  - Mọi phản hồi từ MCP Gateway được validate bằng schema `day09-mcp-evidence-v1`.
+  - Trích xuất `evidence_ref` thật từ MCP server và ghi nhận vào trace event `tool_result_consumed`.
+  - Tuyệt đối không can thiệp, tự tạo mã giả hoặc chia sẻ `evidence_ref` chéo giữa các case.
+- **Conflict Handling**:
+  - Khi có sự sai lệch giữa thông tin khách hàng tự khai (`claimed_order_id`, claim amount) và dữ liệu hệ thống từ MCP, hệ thống ưu tiên dữ liệu chứng cứ từ MCP Gateway (`authoritative source precedence`).
 
 ## 5. Failure and efficiency policy
 
 | Failure | Retry budget | Fallback | Trace event/code |
 | --- | ---: | --- | --- |
-| MCP tool error (ví dụ order không có refund) | 0 | Coi như không có evidence cho domain đó | `tool_result_consumed` / `EVIDENCE_UNAVAILABLE` |
-| Entity not found/ambiguous | 0 | Output `insufficient_evidence`, `needs_investigation`, `escalate_manual_review` | `handoff` / `ENTITY_NOT_FOUND`, `verification_completed` / `ESCALATED` |
-| Source conflict | – | Chọn customer history theo precedence, ghi `data_conflicts` | `handoff` / `CONFLICTS_RESOLVED` |
-| Invalid specialist result / thiếu policy rule | 0 | Output `insufficient_evidence` | `verification_completed` / `POLICY_MISSING` hoặc `FLAGGED` |
-| LLM trả JSON sai / issue ngoài enum | 0 | Dùng phân loại rule, confidence mặc định | `handoff` / `LLM_INVALID_RULES_FALLBACK` |
-| LLM mâu thuẫn với evidence | 0 | Verifier giữ issue theo evidence, confidence 0.7, bỏ verdict claim của model | `handoff` / `LLM_OVERRULED_BY_EVIDENCE` |
-| Mất kết nối MCP | 5 lần/case, backoff 10 s × n | Kết nối lại, rollback trace của case đang dở và chạy lại case đó | stderr `connection lost ... reconnecting` |
+| MCP tool call error | 1 retry | Bỏ qua tool phụ không bắt buộc, giữ tool cốt lõi | `tool_call_failed` |
+| Entity ambiguous / not found | 0 retry | Chọn candidate đầu tiên hoặc claimed_order_id, confidence = 0.5 | `entity_ambiguous` |
+| Missing seller/product context | 0 retry | Fallback sang danh sách seller từ shipment limits | `context_skipped` |
+| LLM API rate limit / timeout | 1 retry | Chuyển sang deterministic rule-based specialist | `llm_fallback` |
 
-Query budget: 8 call/case (history, order, items, product, shipment, payment timeline, refund timeline, policy), thêm `get_sellers` khi seller chịu trách nhiệm (tối đa 9). Không gọi `get_order_payments` (trùng với payment timeline), không kiểm tra candidate đã bị history loại. Cache theo key `(tool, arguments)` trong case; call lỗi cũng được nhớ để không gọi lại. Các call cách nhau 0.4 s vì gateway ngắt kết nối khi bị gọi dồn (~80 call trong ~25 s).
+- **Quản lý Cache & Budget gọi tool (Efficiency Score)**:
+  - Áp dụng bộ nhớ đệm `evidence_cache` trong phạm vi từng case: cùng 1 tool và tham số chỉ được gọi duy nhất 1 lần.
+  - Không gọi `get_order` đối với các candidate giả mạo không tồn tại trong `get_customer_history`.
 
 ## 6. Verification invariants
 
-- Schema: CLI validate output với `l3b-output-v2` trước khi ghi file.
-- Entity scope: `resolved_order_ids` và `rejected_candidates` rời nhau; item/seller/payment chỉ lấy từ phiên bản đã chọn.
-- Evidence ownership: chỉ dùng `evidence_ref` do gateway trả về trong case hiện tại; output có ít nhất một ref.
-- Refund: `no_action` ⇒ refund = 0; tổng `refund_lines` = `recommended_refund_brl`; refund ≤ tổng capture.
-- Responsibility: seller trong `responsible_parties` phải thuộc `affected_entities.seller_ids`.
-- Vi phạm bất kỳ invariant nào → confidence ≤ 0.5 và `verification_completed` / `FLAGGED`.
+Trước khi xuất kết quả ra `outputs/<case_id>.json`, Verifier kiểm tra các bất biến (invariants):
+1. **Schema Invariant**: Output tuân thủ 100% schema `day09-l3b-output-v2`.
+2. **Entity Consistency**: Mọi candidate order ID phải nằm trong `resolved_order_ids` hoặc `rejected_candidates`.
+3. **Provenance Invariant**: Danh sách `evidence_refs` của output chỉ chứa các ref thực tế đã thu thập và emit trong case hiện tại.
+4. **Financial Consistency**: Nếu `primary_issue` không yêu cầu hoàn tiền (`no_action`), `recommended_refund_brl` phải bằng 0. Nếu có hoàn tiền, số tiền phải khớp với chính sách `refund_brl` và không vượt quá `captured_total_brl`.
+5. **Responsibility Invariant**: Nếu kết luận `seller_delay`, bên chịu trách nhiệm phải có `party_type == "seller"`. Nếu `logistics_delay`, bên chịu trách nhiệm phải là `logistics_provider`.
 
 ## 7. Reproducibility
 
-- Model: `Qwen/Qwen3-8B`, gọi qua API chuẩn OpenAI (vLLM: `vllm serve Qwen/Qwen3-8B`), cấu hình bằng `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`. `temperature=0`, non-thinking mode (`chat_template_kwargs.enable_thinking=false`, đổi bằng `LLM_THINKING=1`), `max_tokens=384`. Backend `transformers` (chạy model tại chỗ trên GPU) vẫn dùng được; `LLM_BACKEND=off` để chạy chỉ bằng rule.
-- Trước khi mở MCP session, CLI kiểm tra endpoint LLM và tên model đang được serve; sai cấu hình thì dừng ngay thay vì âm thầm fallback ở mọi case. Request LLM lỗi sau 2 lần retry của client → verifier dùng rule (`LLM_INVALID_RULES_FALLBACK`).
-- Python ≥ 3.11, dependency theo `pyproject.toml` (`pip install -e ".[llm]"`).
-- Chạy tuần tự từng case (concurrency = 1), một MCP session cho cả lần chạy, `CALL_INTERVAL_SECONDS = 0.4`.
-- Lệnh: `day09 run && day09 validate && day09 package --output dist/submission.zip`.
+- **Mô hình**: Google Gemma 2 9B (`gemma2-9b-it`) / Gemma 3 4B (`google/gemma-3-4b-it`) hoặc Qwen 2.5 7B (`qwen-2.5-7b-instruct`) tuân thủ nghiêm ngặt giới hạn $\le$ 9 tỷ tham số.
+- **Môi trường**: Python 3.11+, MCP Client SDK 2.x, `httpx2`, `jsonschema`.
+- **Lệnh thực thi**:
+  ```powershell
+  day09 run
+  day09 validate
+  day09 package --output dist/submission.zip
+  ```
