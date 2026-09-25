@@ -121,13 +121,14 @@ async def solve_case(
             evidence_ref = res.get("evidence_ref")
             trace.emit(
                 case_id=case["case_id"], 
-                event_type="tool_called", 
+                event_type="tool_result_consumed", 
                 actor="coordinator", 
                 tool_name=tool_name, 
                 evidence_refs=[evidence_ref] if evidence_ref else []
             )
             return {"tool": tool_name, "data": res}
         except Exception as e:
+            print(f"[{case['case_id']}] Tool {tool_name} failed: {e}")
             return {"tool": tool_name, "error": str(e)}
 
     tasks = []
