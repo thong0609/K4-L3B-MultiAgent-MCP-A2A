@@ -44,7 +44,7 @@ async def _run(root: Path) -> None:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
-        sem = asyncio.Semaphore(5)
+        sem = asyncio.Semaphore(2)
         
         async def process_case(case_id: str):
             async with sem:

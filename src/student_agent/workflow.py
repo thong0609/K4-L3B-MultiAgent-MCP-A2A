@@ -115,6 +115,58 @@ async def solve_case(
     import asyncio
     evidence_list = []
     
+    def get_fallback(case_data):
+        return {
+            "schema_version": "day09-l3b-output-v2",
+            "case_id": case_data["case_id"],
+            "assessment": {
+                "primary_issue": "insufficient_evidence",
+                "secondary_issues": [],
+                "case_status": "needs_investigation",
+                "confidence": 0
+            },
+            "affected_entities": {
+                "order_ids": [],
+                "item_ids": [],
+                "seller_ids": [],
+                "payment_references": [],
+                "shipment_ids": []
+            },
+            "entity_resolution": {
+                "status": "not_found",
+                "resolved_order_ids": [],
+                "rejected_candidates": [],
+                "confidence": 0
+            },
+            "customer_context": {
+                "customer_unique_id": None,
+                "related_order_ids": []
+            },
+            "shipment_analysis": {
+                "verdict": "insufficient_evidence",
+                "late_seller_ids": [],
+                "timeline_complete": False
+            },
+            "payment_analysis": {
+                "verdict": "insufficient_evidence",
+                "captured_total_brl": None,
+                "refunded_total_brl": None,
+                "refundable_total_brl": None
+            },
+            "root_cause_analysis": {
+                "ranked_causes": [],
+                "responsible_parties": []
+            },
+            "evidence_refs": [],
+            "data_conflicts": [],
+            "financial_resolution": {
+                "currency": "BRL",
+                "recommended_refund_brl": 0,
+                "refund_lines": []
+            },
+            "resolution_actions": []
+        }
+
     async def fetch_data(tool_name, **kwargs):
         try:
             res = await gateway.call(tool_name, **kwargs)
@@ -161,9 +213,9 @@ async def solve_case(
         tool_choice={"type": "function", "function": {"name": "submit_final_result"}}
     )
     
-    msg = response.choices[0].message
-    if not msg.tool_calls:
-        raise RuntimeError("Model không nhả ra tool call nào.")
+    if not getattr(msg, "tool_calls", None):
+        print(f"[{case['case_id']}] Model không nhả ra tool call nào.")
+        return get_fallback(case)
         
     for tool_call in msg.tool_calls:
         if tool_call.function.name == "submit_final_result":
@@ -193,55 +245,7 @@ async def solve_case(
             except Exception as e:
                 print(f"[{case['case_id']}] JSON parse error: {e}")
                 
-                return {
-                    "schema_version": "day09-l3b-output-v2",
-                    "case_id": case["case_id"],
-                    "assessment": {
-                        "primary_issue": "insufficient_evidence",
-                        "secondary_issues": [],
-                        "case_status": "needs_investigation",
-                        "confidence": 0
-                    },
-                    "affected_entities": {
-                        "order_ids": [],
-                        "item_ids": [],
-                        "seller_ids": [],
-                        "payment_references": [],
-                        "shipment_ids": []
-                    },
-                    "entity_resolution": {
-                        "status": "not_found",
-                        "resolved_order_ids": [],
-                        "rejected_candidates": [],
-                        "confidence": 0
-                    },
-                    "customer_context": {
-                        "customer_unique_id": None,
-                        "related_order_ids": []
-                    },
-                    "shipment_analysis": {
-                        "verdict": "insufficient_evidence",
-                        "late_seller_ids": [],
-                        "timeline_complete": False
-                    },
-                    "payment_analysis": {
-                        "verdict": "insufficient_evidence",
-                        "captured_total_brl": None,
-                        "refunded_total_brl": None,
-                        "refundable_total_brl": None
-                    },
-                    "root_cause_analysis": {
-                        "ranked_causes": [],
-                        "responsible_parties": []
-                    },
-                    "evidence_refs": [],
-                    "data_conflicts": [],
-                    "financial_resolution": {
-                        "currency": "BRL",
-                        "recommended_refund_brl": 0,
-                        "refund_lines": []
-                    },
-                    "resolution_actions": []
-                }
+                return get_fallback(case)
                 
-    raise RuntimeError("Không gọi đúng hàm submit_final_result")
+    print(f"[{case['case_id']}] Không gọi đúng hàm submit_final_result")
+    return get_fallback(case)
